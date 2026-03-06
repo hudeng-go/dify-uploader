@@ -22,6 +22,26 @@ import requests
 import yaml
 
 
+logger = logging.getLogger("dify_uploader")
+
+
+def setup_logger(level: str = "INFO", log_file: str = "") -> None:
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+
 class ChangeType(Enum):
     ADDED = "A"
     MODIFIED = "M"
@@ -115,31 +135,11 @@ class Config:
 class DifyUploader:
     def __init__(self, config: Config):
         self.config = config
-        self.logger = self._setup_logger()
         self.session = requests.Session()
         self.session.headers.update(
             {"Authorization": f"Bearer {config.dify_api_key}"}
         )
         self._document_cache: dict[str, dict] = {}
-
-    def _setup_logger(self) -> logging.Logger:
-        logger = logging.getLogger("dify_uploader")
-        logger.setLevel(getattr(logging, self.config.log_level.upper(), logging.INFO))
-
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-        if self.config.log_file:
-            file_handler = logging.FileHandler(self.config.log_file, encoding="utf-8")
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-
-        return logger
 
     def _is_git_repo(self) -> bool:
         repo_path = Path(self.config.git_repo_path)
@@ -155,8 +155,8 @@ class DifyUploader:
             text=True,
         )
         if result.returncode != 0:
-            self.logger.warning(f"Git command failed: git {' '.join(args)}")
-            self.logger.warning(f"Error: {result.stderr}")
+            logger.warning(f"Git command failed: git {' '.join(args)}")
+            logger.warning(f"Error: {result.stderr}")
             return ""
         return result.stdout.strip()
 
@@ -177,7 +177,7 @@ class DifyUploader:
             return False, "Cannot determine branch hashes"
 
         if local_hash != remote_hash:
-            self.logger.info(f"Local branch behind remote, pulling latest changes...")
+            logger.info(f"Local branch behind remote, pulling latest changes...")
             pull_result = self._run_git_command(["pull"])
             if not pull_result and pull_result != "":
                 return False, "Failed to pull latest changes"
@@ -185,7 +185,7 @@ class DifyUploader:
             local_hash = self._run_git_command(["rev-parse", local_branch])
             if not local_hash:
                 return False, "Cannot determine local hash after pull"
-            self.logger.info(f"Pulled successfully, now at commit {local_hash[:8]}")
+            logger.info(f"Pulled successfully, now at commit {local_hash[:8]}")
 
         return True, local_hash
 
@@ -198,7 +198,7 @@ class DifyUploader:
         )
 
         if not diff_output:
-            self.logger.info(f"No changed files since commit {from_commit[:8]}")
+            logger.info(f"No changed files since commit {from_commit[:8]}")
             return []
 
         repo_path = Path(self.config.git_repo_path)
@@ -251,12 +251,12 @@ class DifyUploader:
 
     def _update_config_commit_hash(self, commit_hash: str):
         if not self.config.config_file_path:
-            self.logger.warning("No config file path set, cannot update commit hash")
+            logger.warning("No config file path set, cannot update commit hash")
             return
 
         config_path = Path(self.config.config_file_path)
         if not config_path.exists():
-            self.logger.warning(f"Config file not found: {config_path}")
+            logger.warning(f"Config file not found: {config_path}")
             return
 
         with open(config_path, "r", encoding="utf-8") as f:
@@ -269,7 +269,7 @@ class DifyUploader:
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
-        self.logger.info(f"Updated last_synced_commit to {commit_hash[:8]}")
+        logger.info(f"Updated last_synced_commit to {commit_hash[:8]}")
 
     def _get_all_files(self) -> list[FileChange]:
         repo_path = Path(self.config.git_repo_path)
@@ -302,7 +302,7 @@ class DifyUploader:
         )
 
         if not diff_output:
-            self.logger.info("No changed files detected")
+            logger.info("No changed files detected")
             return []
 
         repo_path = Path(self.config.git_repo_path)
@@ -442,17 +442,17 @@ class DifyUploader:
             files = {"file": (file_path.name, f)}
             data = {"data": data_str}
 
-            self.logger.info(f"Uploading: {file_path}")
+            logger.info(f"Uploading: {file_path}")
             response = self.session.post(url, files=files, data=data)
 
         if response.status_code == 200:
-            self.logger.info(f"Successfully uploaded: {file_path.name}")
+            logger.info(f"Successfully uploaded: {file_path.name}")
             doc = response.json().get("document", {})
             if doc.get("name"):
                 self._document_cache[doc["name"]] = doc
             return response.json()
         else:
-            self.logger.error(
+            logger.error(
                 f"Failed to upload {file_path.name}: {response.status_code} - {response.text}"
             )
             return {"error": response.text, "status_code": response.status_code}
@@ -460,7 +460,7 @@ class DifyUploader:
     def update_file(self, file_path: Path) -> dict:
         existing_doc = self._find_document_by_name(file_path.name)
         if not existing_doc:
-            self.logger.info(f"Document not found for update, creating new: {file_path.name}")
+            logger.info(f"Document not found for update, creating new: {file_path.name}")
             return self.upload_file(file_path)
 
         document_id = existing_doc.get("id")
@@ -472,17 +472,17 @@ class DifyUploader:
             files = {"file": (file_path.name, f)}
             data = {"data": data_str}
 
-            self.logger.info(f"Updating: {file_path}")
+            logger.info(f"Updating: {file_path}")
             response = self.session.post(url, files=files, data=data)
 
         if response.status_code == 200:
-            self.logger.info(f"Successfully updated: {file_path.name}")
+            logger.info(f"Successfully updated: {file_path.name}")
             doc = response.json().get("document", {})
             if doc.get("name"):
                 self._document_cache[doc["name"]] = doc
             return response.json()
         else:
-            self.logger.error(
+            logger.error(
                 f"Failed to update {file_path.name}: {response.status_code} - {response.text}"
             )
             return {"error": response.text, "status_code": response.status_code}
@@ -490,22 +490,22 @@ class DifyUploader:
     def delete_document(self, file_path: Path) -> dict:
         existing_doc = self._find_document_by_name(file_path.name)
         if not existing_doc:
-            self.logger.warning(f"Document not found for deletion: {file_path.name}")
+            logger.warning(f"Document not found for deletion: {file_path.name}")
             return {"warning": f"Document not found: {file_path.name}", "skipped": True}
 
         document_id = existing_doc.get("id")
         url = f"{self.config.dify_api_base_url.rstrip('/')}/datasets/{self.config.dify_dataset_id}/documents/{document_id}"
 
-        self.logger.info(f"Deleting: {file_path.name} (document_id: {document_id})")
+        logger.info(f"Deleting: {file_path.name} (document_id: {document_id})")
         response = self.session.delete(url)
 
         if response.status_code in (200, 204):
-            self.logger.info(f"Successfully deleted: {file_path.name}")
+            logger.info(f"Successfully deleted: {file_path.name}")
             if file_path.name in self._document_cache:
                 del self._document_cache[file_path.name]
             return {"success": True, "document_id": document_id}
         else:
-            self.logger.error(
+            logger.error(
                 f"Failed to delete {file_path.name}: {response.status_code} - {response.text}"
             )
             return {"error": response.text, "status_code": response.status_code}
@@ -528,10 +528,10 @@ class DifyUploader:
 
         if not is_git_repo:
             changes = self._get_all_files()
-            self.logger.info(f"Not a git repository: found {len(changes)} files to upload")
+            logger.info(f"Not a git repository: found {len(changes)} files to upload")
         elif self.config.upload_mode == "full":
             changes = self._get_all_files()
-            self.logger.info(f"Full upload mode: found {len(changes)} files")
+            logger.info(f"Full upload mode: found {len(changes)} files")
             if is_git_repo:
                 current_commit = self._get_current_commit_hash()
                 should_update_commit = True
@@ -541,27 +541,27 @@ class DifyUploader:
                 raise ValueError(f"Branch sync check failed: {sync_result}")
 
             current_commit = sync_result
-            self.logger.info(f"Branches in sync at commit {current_commit[:8]}")
+            logger.info(f"Branches in sync at commit {current_commit[:8]}")
 
             if not self.config.last_synced_commit:
-                self.logger.info("No last_synced_commit found, performing full sync")
+                logger.info("No last_synced_commit found, performing full sync")
                 changes = self._get_all_files()
             else:
-                self.logger.info(f"Last synced commit: {self.config.last_synced_commit[:8]}")
+                logger.info(f"Last synced commit: {self.config.last_synced_commit[:8]}")
                 changes = self._get_changed_files_since_commit(self.config.last_synced_commit)
 
             should_update_commit = True
-            self.logger.info(f"Incremental upload mode: found {len(changes)} changed files")
+            logger.info(f"Incremental upload mode: found {len(changes)} changed files")
 
         if dry_run:
-            self.logger.info("Dry run mode - operations that would be performed:")
+            logger.info("Dry run mode - operations that would be performed:")
             for change in changes:
                 op = {
                     ChangeType.ADDED: "UPLOAD (new)",
                     ChangeType.MODIFIED: "UPDATE",
                     ChangeType.DELETED: "DELETE"
                 }.get(change.change_type, "UNKNOWN")
-                self.logger.info(f"  [{op}] {change.path}")
+                logger.info(f"  [{op}] {change.path}")
             return {
                 "dry_run": True,
                 "files_count": len(changes),
@@ -623,7 +623,7 @@ class DifyUploader:
             "failed": len(results["failed"]),
             "skipped": len(results["skipped"])
         }
-        self.logger.info(
+        logger.info(
             f"Upload complete: {summary['uploaded']} uploaded, {summary['updated']} updated, "
             f"{summary['deleted']} deleted, {summary['failed']} failed, {summary['skipped']} skipped"
         )
@@ -680,7 +680,11 @@ def main():
         config = Config.from_yaml(str(config_path))
     else:
         config = Config()
-        logging.warning(f"Config file not found: {config_path}, using defaults and environment")
+
+    setup_logger(config.log_level, config.log_file)
+
+    if not config_path.exists():
+        logger.warning(f"Config file not found: {config_path}, using defaults and environment")
 
     config.apply_env_overrides()
 
@@ -698,9 +702,9 @@ def main():
     try:
         uploader = DifyUploader(config)
         results = uploader.run(dry_run=args.dry_run)
-        uploader.logger.debug(json.dumps(results, indent=2, ensure_ascii=False))
+        logger.debug(json.dumps(results, indent=2, ensure_ascii=False))
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logger.error(f"Error: {e}")
         sys.exit(1)
 
 
