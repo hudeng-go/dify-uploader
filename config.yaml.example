@@ -1,0 +1,72 @@
+# Dify 知识库上传配置文件
+
+# Dify API 配置
+dify:
+  # API 基础 URL (也可通过环境变量 DIFY_API_URL 或命令行 --api-url 设置)
+  api_url: "https://api.dify.ai/v1/v1"
+  # API Key (也可通过环境变量 DIFY_API_KEY 或命令行 --api-key 设置)
+  api_key: ""
+  # 数据集/知识库 ID (也可通过环境变量 DIFY_DATASET_ID 或命令行 --dataset-id 设置)
+  dataset_id: ""
+
+# Git 仓库配置
+git:
+  # Git 仓库路径 (本地路径)
+  repo_path: ""
+  # 远程分支名称 (用于增量模式比较)
+  remote_branch: "origin/main"
+  # 本地分支名称 (可选，默认为当前分支)
+  local_branch: "main"
+
+# 文件过滤配置
+file_filter:
+  # 要上传的文件扩展名列表 (支持通配符 * 表示所有文件)
+  # 示例: ["*.md", "*.txt", "*.pdf"] 或 ["*"] 表示所有文件
+  extensions:
+    - "*.md"
+    - "*.txt"
+    - "*.rst"
+    - "*.pdf"
+  # 要排除的文件/目录模式
+  exclude_patterns:
+    - ".git/**"
+    - "node_modules/**"
+    - "__pycache__/**"
+    - ".venv/**"
+    - "*.pyc"
+    - "*.pyo"
+  # 要包含的目录 (空列表表示整个仓库)
+  include_dirs: []
+  # 要排除的目录
+  exclude_dirs:
+    - ".git"
+    - "node_modules"
+    - "__pycache__"
+
+# 上传模式配置
+upload:
+  # 上传模式: "full" (全量上传) 或 "incremental" (增量上传)
+  mode: "incremental"
+  # 索引技术: "high_quality" 或 "economy"
+  indexing_technique: "high_quality"
+  # 处理规则
+  process_rule:
+    # 模式: "automatic" (自动) 或 "custom" (自定义)
+    mode: "automatic"
+    # 自定义分割规则 (当 mode 为 custom 时有效)
+    # rules:
+    #   segmentation:
+    #     separator: "\n"
+    #     max_tokens: 500
+  # 摘要索引设置 (可选)
+  # summary_index_setting:
+  #   enable: true
+  #   model_name: "qwen-vl-plus"
+  #   model_provider_name: "langgenius/tongyi/tongyi"
+
+# 日志配置
+logging:
+  # 日志级别: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  # 日志文件路径 (可选)
+  file: ""
