@@ -17,6 +17,8 @@ git:
   remote_branch: "origin/main"
   # 本地分支名称 (可选，默认为当前分支)
   local_branch: "main"
+  # 已经同步的git hash值
+  last_synced_commit: ""
 
 # 文件过滤配置
 file_filter:

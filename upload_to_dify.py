@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 import yaml
@@ -44,6 +44,8 @@ class Config:
     git_repo_path: str = ""
     git_remote_branch: str = "origin/main"
     git_local_branch: str = ""
+    last_synced_commit: str = ""
+    config_file_path: str = ""
     file_extensions: list = field(default_factory=lambda: ["*.md", "*.txt"])
     exclude_patterns: list = field(default_factory=list)
     include_dirs: list = field(default_factory=list)
@@ -62,6 +64,7 @@ class Config:
             data = yaml.safe_load(f) or {}
 
         config = cls()
+        config.config_file_path = yaml_path
 
         dify_cfg = data.get("dify", {})
         config.dify_api_base_url = dify_cfg.get("api_url", config.dify_api_base_url)
@@ -72,6 +75,7 @@ class Config:
         config.git_repo_path = git_cfg.get("repo_path", "")
         config.git_remote_branch = git_cfg.get("remote_branch", "origin/main")
         config.git_local_branch = git_cfg.get("local_branch", "")
+        config.last_synced_commit = git_cfg.get("last_synced_commit", "")
 
         filter_cfg = data.get("file_filter", {})
         config.file_extensions = filter_cfg.get("extensions", ["*.md", "*.txt"])
@@ -155,6 +159,117 @@ class DifyUploader:
             self.logger.warning(f"Error: {result.stderr}")
             return ""
         return result.stdout.strip()
+
+    def _get_current_commit_hash(self) -> str:
+        return self._run_git_command(["rev-parse", "HEAD"])
+
+    def _check_branch_sync(self) -> tuple[bool, str]:
+        self._run_git_command(["fetch"])
+        local_branch = self.config.git_local_branch or self._run_git_command(
+            ["rev-parse", "--abbrev-ref", "HEAD"]
+        )
+        remote_branch = self.config.git_remote_branch
+
+        local_hash = self._run_git_command(["rev-parse", local_branch])
+        remote_hash = self._run_git_command(["rev-parse", remote_branch])
+
+        if not local_hash or not remote_hash:
+            return False, "Cannot determine branch hashes"
+
+        if local_hash != remote_hash:
+            self.logger.info(f"Local branch behind remote, pulling latest changes...")
+            pull_result = self._run_git_command(["pull"])
+            if not pull_result and pull_result != "":
+                return False, "Failed to pull latest changes"
+            
+            local_hash = self._run_git_command(["rev-parse", local_branch])
+            if not local_hash:
+                return False, "Cannot determine local hash after pull"
+            self.logger.info(f"Pulled successfully, now at commit {local_hash[:8]}")
+
+        return True, local_hash
+
+    def _get_changed_files_since_commit(self, from_commit: str) -> list[FileChange]:
+        if not from_commit:
+            return self._get_all_files()
+
+        diff_output = self._run_git_command(
+            ["diff", "--name-status", f"{from_commit}..HEAD"]
+        )
+
+        if not diff_output:
+            self.logger.info(f"No changed files since commit {from_commit[:8]}")
+            return []
+
+        repo_path = Path(self.config.git_repo_path)
+        changed_files = []
+
+        for line in diff_output.split("\n"):
+            if not line.strip():
+                continue
+
+            parts = line.strip().split("\t")
+            if not parts:
+                continue
+
+            status = parts[0][0]
+
+            if status == "R":
+                old_path = repo_path / parts[1]
+                new_path = repo_path / parts[2]
+                old_name = old_path.name
+                new_name = new_path.name
+
+                if old_name != new_name:
+                    if self._should_include_file_by_name(old_name):
+                        changed_files.append(FileChange(
+                            path=old_path,
+                            change_type=ChangeType.DELETED
+                        ))
+                    if new_path.exists() and self._should_include_file(new_path, repo_path):
+                        changed_files.append(FileChange(
+                            path=new_path,
+                            change_type=ChangeType.ADDED
+                        ))
+            elif status == "D":
+                file_path = repo_path / parts[1]
+                if self._should_include_file(file_path, repo_path):
+                    changed_files.append(FileChange(
+                        path=file_path,
+                        change_type=ChangeType.DELETED
+                    ))
+            elif status in ("A", "M"):
+                file_path = repo_path / parts[1]
+                if file_path.exists() and self._should_include_file(file_path, repo_path):
+                    change_type = ChangeType.ADDED if status == "A" else ChangeType.MODIFIED
+                    changed_files.append(FileChange(
+                        path=file_path,
+                        change_type=change_type
+                    ))
+
+        return changed_files
+
+    def _update_config_commit_hash(self, commit_hash: str):
+        if not self.config.config_file_path:
+            self.logger.warning("No config file path set, cannot update commit hash")
+            return
+
+        config_path = Path(self.config.config_file_path)
+        if not config_path.exists():
+            self.logger.warning(f"Config file not found: {config_path}")
+            return
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        if "git" not in data:
+            data["git"] = {}
+        data["git"]["last_synced_commit"] = commit_hash
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        self.logger.info(f"Updated last_synced_commit to {commit_hash[:8]}")
 
     def _get_all_files(self) -> list[FileChange]:
         repo_path = Path(self.config.git_repo_path)
@@ -298,7 +413,7 @@ class DifyUploader:
 
     def _get_documents_list(self, keyword: Optional[str] = None) -> list[dict]:
         url = f"{self.config.dify_api_base_url.rstrip('/')}/datasets/{self.config.dify_dataset_id}/documents"
-        params = {"limit": 100}
+        params: dict[str, int | str] = {"limit": 100}
         if keyword:
             params["keyword"] = keyword
 
@@ -408,6 +523,8 @@ class DifyUploader:
             raise FileNotFoundError(f"Directory path not found: {repo_path}")
 
         is_git_repo = self._is_git_repo()
+        current_commit = ""
+        should_update_commit = False
 
         if not is_git_repo:
             changes = self._get_all_files()
@@ -415,8 +532,25 @@ class DifyUploader:
         elif self.config.upload_mode == "full":
             changes = self._get_all_files()
             self.logger.info(f"Full upload mode: found {len(changes)} files")
+            if is_git_repo:
+                current_commit = self._get_current_commit_hash()
+                should_update_commit = True
         else:
-            changes = self._get_changed_files()
+            in_sync, sync_result = self._check_branch_sync()
+            if not in_sync:
+                raise ValueError(f"Branch sync check failed: {sync_result}")
+
+            current_commit = sync_result
+            self.logger.info(f"Branches in sync at commit {current_commit[:8]}")
+
+            if not self.config.last_synced_commit:
+                self.logger.info("No last_synced_commit found, performing full sync")
+                changes = self._get_all_files()
+            else:
+                self.logger.info(f"Last synced commit: {self.config.last_synced_commit[:8]}")
+                changes = self._get_changed_files_since_commit(self.config.last_synced_commit)
+
+            should_update_commit = True
             self.logger.info(f"Incremental upload mode: found {len(changes)} changed files")
 
         if dry_run:
@@ -434,7 +568,7 @@ class DifyUploader:
                 "files": [{"path": str(c.path), "action": c.change_type.value} for c in changes]
             }
 
-        results = {
+        results: dict[str, Any] = {
             "uploaded": [],
             "updated": [],
             "deleted": [],
@@ -494,6 +628,11 @@ class DifyUploader:
             f"{summary['deleted']} deleted, {summary['failed']} failed, {summary['skipped']} skipped"
         )
         results["summary"] = summary
+
+        if should_update_commit and current_commit and results["failed"].__len__() == 0:
+            self._update_config_commit_hash(current_commit)
+            results["synced_commit"] = current_commit
+
         return results
 
 
