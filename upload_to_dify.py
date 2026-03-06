@@ -698,7 +698,7 @@ def main():
     try:
         uploader = DifyUploader(config)
         results = uploader.run(dry_run=args.dry_run)
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+        uploader.logger.debug(json.dumps(results, indent=2, ensure_ascii=False))
     except Exception as e:
         logging.error(f"Error: {e}")
         sys.exit(1)
