@@ -3,6 +3,7 @@
 
 Upload files from a Git repository to Dify knowledge base.
 Supports both full upload and incremental upload modes.
+Supports create, update, and delete operations based on git change types.
 """
 
 import argparse
@@ -13,11 +14,26 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import requests
 import yaml
+
+
+class ChangeType(Enum):
+    ADDED = "A"
+    MODIFIED = "M"
+    DELETED = "D"
+    RENAMED = "R"
+
+
+@dataclass(frozen=True)
+class FileChange:
+    path: Path
+    change_type: ChangeType
+    old_path: Optional[Path] = None
 
 
 @dataclass
@@ -100,6 +116,7 @@ class DifyUploader:
         self.session.headers.update(
             {"Authorization": f"Bearer {config.dify_api_key}"}
         )
+        self._document_cache: dict[str, dict] = {}
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger("dify_uploader")
@@ -139,7 +156,7 @@ class DifyUploader:
             return ""
         return result.stdout.strip()
 
-    def _get_all_files(self) -> list[Path]:
+    def _get_all_files(self) -> list[FileChange]:
         repo_path = Path(self.config.git_repo_path)
         all_files = []
 
@@ -150,15 +167,15 @@ class DifyUploader:
                     for f in files:
                         file_path = Path(root) / f
                         if self._should_include_file(file_path, repo_path):
-                            all_files.append(file_path)
+                            all_files.append(FileChange(path=file_path, change_type=ChangeType.ADDED))
             else:
                 for file_path in repo_path.rglob(pattern):
                     if self._should_include_file(file_path, repo_path):
-                        all_files.append(file_path)
+                        all_files.append(FileChange(path=file_path, change_type=ChangeType.ADDED))
 
-        return sorted(set(all_files))
+        return sorted(set(all_files), key=lambda x: str(x.path))
 
-    def _get_changed_files(self) -> list[Path]:
+    def _get_changed_files(self) -> list[FileChange]:
         self._run_git_command(["fetch"])
         local_branch = self.config.git_local_branch or self._run_git_command(
             ["rev-parse", "--abbrev-ref", "HEAD"]
@@ -166,7 +183,7 @@ class DifyUploader:
         remote_branch = self.config.git_remote_branch
 
         diff_output = self._run_git_command(
-            ["diff", "--name-only", f"{remote_branch}...{local_branch}"]
+            ["diff", "--name-status", f"{remote_branch}...{local_branch}"]
         )
 
         if not diff_output:
@@ -179,9 +196,45 @@ class DifyUploader:
         for line in diff_output.split("\n"):
             if not line.strip():
                 continue
-            file_path = repo_path / line.strip()
-            if file_path.exists() and self._should_include_file(file_path, repo_path):
-                changed_files.append(file_path)
+
+            parts = line.strip().split("\t")
+            if not parts:
+                continue
+
+            status = parts[0][0]
+
+            if status == "R":
+                old_path = repo_path / parts[1]
+                new_path = repo_path / parts[2]
+                old_name = old_path.name
+                new_name = new_path.name
+
+                if old_name != new_name:
+                    if self._should_include_file_by_name(old_name):
+                        changed_files.append(FileChange(
+                            path=old_path,
+                            change_type=ChangeType.DELETED
+                        ))
+                    if new_path.exists() and self._should_include_file(new_path, repo_path):
+                        changed_files.append(FileChange(
+                            path=new_path,
+                            change_type=ChangeType.ADDED
+                        ))
+            elif status == "D":
+                file_path = repo_path / parts[1]
+                if self._should_include_file(file_path, repo_path):
+                    changed_files.append(FileChange(
+                        path=file_path,
+                        change_type=ChangeType.DELETED
+                    ))
+            elif status in ("A", "M"):
+                file_path = repo_path / parts[1]
+                if file_path.exists() and self._should_include_file(file_path, repo_path):
+                    change_type = ChangeType.ADDED if status == "A" else ChangeType.MODIFIED
+                    changed_files.append(FileChange(
+                        path=file_path,
+                        change_type=change_type
+                    ))
 
         return changed_files
 
@@ -219,6 +272,15 @@ class DifyUploader:
 
         return False
 
+    def _should_include_file_by_name(self, file_name: str) -> bool:
+        for pattern in self.config.file_extensions:
+            if pattern == "*":
+                return True
+            ext = pattern.lstrip("*")
+            if file_name.endswith(ext) or fnmatch.fnmatch(file_name, pattern):
+                return True
+        return False
+
     def _build_upload_data(self, file_path: Path) -> str:
         data = {
             "indexing_technique": self.config.indexing_technique,
@@ -234,6 +296,28 @@ class DifyUploader:
 
         return json.dumps(data)
 
+    def _get_documents_list(self, keyword: Optional[str] = None) -> list[dict]:
+        url = f"{self.config.dify_api_base_url.rstrip('/')}/datasets/{self.config.dify_dataset_id}/documents"
+        params = {"limit": 100}
+        if keyword:
+            params["keyword"] = keyword
+
+        response = self.session.get(url, params=params)
+        if response.status_code == 200:
+            return response.json().get("data", [])
+        return []
+
+    def _find_document_by_name(self, file_name: str) -> Optional[dict]:
+        if file_name in self._document_cache:
+            return self._document_cache[file_name]
+
+        documents = self._get_documents_list(keyword=file_name)
+        for doc in documents:
+            if doc.get("name") == file_name:
+                self._document_cache[file_name] = doc
+                return doc
+        return None
+
     def upload_file(self, file_path: Path) -> dict:
         url = f"{self.config.dify_api_base_url.rstrip('/')}/datasets/{self.config.dify_dataset_id}/document/create-by-file"
 
@@ -248,10 +332,66 @@ class DifyUploader:
 
         if response.status_code == 200:
             self.logger.info(f"Successfully uploaded: {file_path.name}")
+            doc = response.json().get("document", {})
+            if doc.get("name"):
+                self._document_cache[doc["name"]] = doc
             return response.json()
         else:
             self.logger.error(
                 f"Failed to upload {file_path.name}: {response.status_code} - {response.text}"
+            )
+            return {"error": response.text, "status_code": response.status_code}
+
+    def update_file(self, file_path: Path) -> dict:
+        existing_doc = self._find_document_by_name(file_path.name)
+        if not existing_doc:
+            self.logger.info(f"Document not found for update, creating new: {file_path.name}")
+            return self.upload_file(file_path)
+
+        document_id = existing_doc.get("id")
+        url = f"{self.config.dify_api_base_url.rstrip('/')}/datasets/{self.config.dify_dataset_id}/documents/{document_id}/update-by-file"
+
+        data_str = self._build_upload_data(file_path)
+
+        with open(file_path, "rb") as f:
+            files = {"file": (file_path.name, f)}
+            data = {"data": data_str}
+
+            self.logger.info(f"Updating: {file_path}")
+            response = self.session.post(url, files=files, data=data)
+
+        if response.status_code == 200:
+            self.logger.info(f"Successfully updated: {file_path.name}")
+            doc = response.json().get("document", {})
+            if doc.get("name"):
+                self._document_cache[doc["name"]] = doc
+            return response.json()
+        else:
+            self.logger.error(
+                f"Failed to update {file_path.name}: {response.status_code} - {response.text}"
+            )
+            return {"error": response.text, "status_code": response.status_code}
+
+    def delete_document(self, file_path: Path) -> dict:
+        existing_doc = self._find_document_by_name(file_path.name)
+        if not existing_doc:
+            self.logger.warning(f"Document not found for deletion: {file_path.name}")
+            return {"warning": f"Document not found: {file_path.name}", "skipped": True}
+
+        document_id = existing_doc.get("id")
+        url = f"{self.config.dify_api_base_url.rstrip('/')}/datasets/{self.config.dify_dataset_id}/documents/{document_id}"
+
+        self.logger.info(f"Deleting: {file_path.name} (document_id: {document_id})")
+        response = self.session.delete(url)
+
+        if response.status_code in (200, 204):
+            self.logger.info(f"Successfully deleted: {file_path.name}")
+            if file_path.name in self._document_cache:
+                del self._document_cache[file_path.name]
+            return {"success": True, "document_id": document_id}
+        else:
+            self.logger.error(
+                f"Failed to delete {file_path.name}: {response.status_code} - {response.text}"
             )
             return {"error": response.text, "status_code": response.status_code}
 
@@ -270,32 +410,90 @@ class DifyUploader:
         is_git_repo = self._is_git_repo()
 
         if not is_git_repo:
-            files = self._get_all_files()
-            self.logger.info(f"Not a git repository: found {len(files)} files to upload")
+            changes = self._get_all_files()
+            self.logger.info(f"Not a git repository: found {len(changes)} files to upload")
         elif self.config.upload_mode == "full":
-            files = self._get_all_files()
-            self.logger.info(f"Full upload mode: found {len(files)} files")
+            changes = self._get_all_files()
+            self.logger.info(f"Full upload mode: found {len(changes)} files")
         else:
-            files = self._get_changed_files()
-            self.logger.info(f"Incremental upload mode: found {len(files)} changed files")
+            changes = self._get_changed_files()
+            self.logger.info(f"Incremental upload mode: found {len(changes)} changed files")
 
         if dry_run:
-            self.logger.info("Dry run mode - files that would be uploaded:")
-            for f in files:
-                self.logger.info(f"  - {f}")
-            return {"dry_run": True, "files_count": len(files), "files": [str(f) for f in files]}
+            self.logger.info("Dry run mode - operations that would be performed:")
+            for change in changes:
+                op = {
+                    ChangeType.ADDED: "UPLOAD (new)",
+                    ChangeType.MODIFIED: "UPDATE",
+                    ChangeType.DELETED: "DELETE"
+                }.get(change.change_type, "UNKNOWN")
+                self.logger.info(f"  [{op}] {change.path}")
+            return {
+                "dry_run": True,
+                "files_count": len(changes),
+                "files": [{"path": str(c.path), "action": c.change_type.value} for c in changes]
+            }
 
-        results = {"success": [], "failed": []}
-        for file_path in files:
-            result = self.upload_file(file_path)
-            if "error" in result:
-                results["failed"].append({"file": str(file_path), "error": result["error"]})
-            else:
-                results["success"].append({"file": str(file_path), "response": result})
+        results = {
+            "uploaded": [],
+            "updated": [],
+            "deleted": [],
+            "failed": [],
+            "skipped": []
+        }
 
+        for change in changes:
+            if change.change_type == ChangeType.ADDED:
+                result = self.upload_file(change.path)
+                if "error" in result:
+                    results["failed"].append({
+                        "action": "upload",
+                        "file": str(change.path),
+                        "error": result["error"]
+                    })
+                else:
+                    results["uploaded"].append({"file": str(change.path), "response": result})
+
+            elif change.change_type == ChangeType.MODIFIED:
+                result = self.update_file(change.path)
+                if "error" in result:
+                    results["failed"].append({
+                        "action": "update",
+                        "file": str(change.path),
+                        "error": result["error"]
+                    })
+                else:
+                    results["updated"].append({"file": str(change.path), "response": result})
+
+            elif change.change_type == ChangeType.DELETED:
+                result = self.delete_document(change.path)
+                if "error" in result:
+                    results["failed"].append({
+                        "action": "delete",
+                        "file": str(change.path),
+                        "error": result["error"]
+                    })
+                elif result.get("skipped"):
+                    results["skipped"].append({
+                        "action": "delete",
+                        "file": str(change.path),
+                        "reason": result.get("warning", "Document not found")
+                    })
+                else:
+                    results["deleted"].append({"file": str(change.path), "document_id": result.get("document_id")})
+
+        summary = {
+            "uploaded": len(results["uploaded"]),
+            "updated": len(results["updated"]),
+            "deleted": len(results["deleted"]),
+            "failed": len(results["failed"]),
+            "skipped": len(results["skipped"])
+        }
         self.logger.info(
-            f"Upload complete: {len(results['success'])} succeeded, {len(results['failed'])} failed"
+            f"Upload complete: {summary['uploaded']} uploaded, {summary['updated']} updated, "
+            f"{summary['deleted']} deleted, {summary['failed']} failed, {summary['skipped']} skipped"
         )
+        results["summary"] = summary
         return results
 
 
